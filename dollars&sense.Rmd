@@ -1,0 +1,1014 @@
+---
+title: "Property Retention Model"
+author: "Gregory Guranich"
+output:
+  html_document:
+    css: style.css
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+<style type="text/css">
+  pre:not([class]) {
+    background-color: white;
+  }
+</style>
+
+
+<style type="text/css">
+h1 {
+  font-size: 34px;
+}
+h1.title {
+  font-size: 60px;
+}
+h2 {
+  font-size: 22px;
+}
+h3 {
+  font-size: 16px;
+}
+h4 {
+  font-size: 14px;
+
+h6 {
+  font-size: 12px;
+}
+.table th:not([align]) {
+  text-align: left;
+}
+</style>
+
+#### 1) Business problem
+
+#### You work for Kangaroo Auto Insurance Company, an Australian company. Your business partner, who is not at all familiar with statistics, would like you to create a retention model based on historical policy data. Your business partner is concerned about the company’s retention rates as well as the key drivers that cause policy cancellations.
+#### For this case competition, your group is tasked with identifying policies that will cancel before the end of their term. With the help of a predictive model, your group will be able to predict those policies that are most likely to cancel as well as understand what variables are most influential in causing a policy cancellation.
+
+```{r setup, include=FALSE}
+
+library('ggplot2') # plots... not used at the moment
+library('polynom') # what is this for?
+library('plyr') # data scrub
+#library(rjags)
+#library(R2jags) # bayes model not seen in this file
+library('glmnet') # for glm model
+library('dplyr') #for data scrub
+library("caret") #for dummy cariables
+#library(VIM) # imputation, not used here
+#library(mice) # na plot
+library(corrplot) #cor plot
+library('pROC') #roc calc
+library(ROCR) # for bagging
+library(foreach) # for bagging
+library('e1071') # for svm
+#-------------------
+Logit <- function(p) log(p/(1-p))
+InvLogit <- function(x) 1/(1+exp(-x))
+
+DerivativeInvLogit <- function(x) 1/(1+exp(-x))^2*exp(-x)
+DerivativeInvLogit <- function(x, beta0=0, beta1 =1) 1/(1+exp(-(beta0+beta1*x)))^2*beta1*exp(-(beta0+beta1*x))
+
+
+
+# Import Data, Merge Data
+Validation <- read.csv("test.csv")
+states <- read.csv("free-zipcode-database-Primary.csv")
+MergedTestData <- merge(Validation,states, by.x = "zip.code", by.y = "Zipcode", all.x = TRUE)
+trav_test <- MergedTestData
+
+# To train model
+trav_orig <- read.csv('train.csv') # keep original set for NA analysis
+MergedTestData <- merge(trav_orig,states, by.x = "zip.code", by.y = "Zipcode", all.x = TRUE)
+trav_complete <- MergedTestData
+
+```
+## Data Cleaning
+### NA Plots
+```{r}
+# NA imputation, DO THIS BEFORE OMIT.NA
+mice_plot <- aggr(trav_orig, col=c('navyblue','yellow'),
+                    numbers=TRUE, sortVars=TRUE,
+                    labels=names(trav_orig), cex.axis=.7,
+                    gap=1, ylab=c("Missing data","Pattern"))
+
+```
+
+
+### Imputation
+```{r}
+# As you saw in the plot above the NAs were created in a pattern (artificial data)
+# This is extra reason to impute the NAs
+# Because of the pattern we no overlap among NAs
+# This allows us to use other correlated variables to predict what the NAs might be
+# Unfortunately for this part, very few of the variables are correlated
+
+# Sales.Channel is correlated with our repsonse cancelation
+# Here we see NA's have about the same rate of cancelation as, phone, and online, 
+# we will impute these NAs by binning all of the above groups (this is sometiems bad practice, consider changing this later)
+sum(is.na(trav_complete$sales.channel))
+
+channel<-ifelse(trav_complete$sales.channel=="Broker", 1, 0)
+channel[(is.na(channel))]<-0
+#sum(is.na(channel)) #just to check
+trav_complete$channel<-channel
+```
+### Erroneous data
+```{r}
+# fixing erroneous cancel entry of -1
+summary(trav_complete$cancel)
+neg <- trav_complete$cancel==-1
+trav_complete$cancel[neg] <- NA
+# fixing erroneous age entry
+# Lets assume age was typed in wrong if over 117 for example 159 could be 59 or 225 could be 25
+# chose 117 because someone who is 18 might have retners insurance if 118=18 this is room for possible typo
+a<-trav_complete$ni.age>117
+trav_complete$ni.age[a]<-NA
+
+## Removal
+# We need to remove the merged data first because variables such as City had 1000s of NAs
+names(trav_complete)
+# OK now we can finally omit the remaining NAs, amros merged set has a bunch of nas so we need to remove all those columns first
+
+
+trav_complete<-trav_complete[,c("cancel","credit","channel","claim.ind","ni.age","tenure","State","year","ni.marital.status",
+                                "n.children","len.at.res","n.adults","dwelling.type","house.color","coverage.type",'premium')]
+#"premium","City","len.at.res","dwelling.type","n.adults","EstimatedPopulation" for use later
+sum(is.na(trav_complete))
+colnames(trav_complete)[7]<-"state"
+trav_complete<-na.omit(trav_complete)
+```
+## Variable Selection
+```{r}
+#The end goal is to dummy encode in order to select reference categories
+#We must start by making data categorical
+#We will use out-of-fold likelihood method
+#Making continuous variables discrete in order to reveal trends
+```
+
+### Adults
+```{r}
+table(trav_complete$cancel,trav_complete$n.adults)
+tab<-table(trav_complete$cancel,trav_complete$n.adults)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+# cancellation rate for each category
+rate
+
+# Lets bin 5+ adults to make a decent size bin
+trav_complete <- trav_complete %>% mutate(adults=cut(n.adults, breaks=c(1,2,3,4,5, Inf), labels=c(1,2,3,4,5)))
+
+#### lets make a general table / rate code
+tab<-table(trav_complete$cancel,trav_complete$adults)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+# cancellation rate for each category
+rate
+x<-c(1,2,3,4,5)
+plot(x,rate, pch=16, xlab="adults", ylab="cancelation %")
+grid()
+lines(rate~x, lwd=3, col='red')
+```
+
+
+```{r}
+# Rates are similar in first 3 bins, lets simplify categories here
+trav_complete <- trav_complete %>% mutate(adults=cut(n.adults, breaks=c(-Inf,3,4,5, Inf), labels=c(1,2,3,4)))
+
+table(trav_complete$cancel,trav_complete$adults)
+tab<-table(trav_complete$cancel,trav_complete$adults)
+rate<-(tab[2,]/tab[1,])
+# cancellation rate for each category
+rate
+```
+### Length of Residence
+```{r}
+
+# lets break it to descrete 1-30
+trav_complete <- trav_complete %>% mutate(length=cut(len.at.res, breaks=c(-Inf, seq(1,30,1), Inf), labels=c(seq(1,31,1))))
+table(trav_complete$cancel,trav_complete$length)
+tab<-table(trav_complete$cancel,trav_complete$length)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+rate
+
+
+rate
+x<-seq(1,31,1)
+plot(x,rate, pch=16, xlab="Length of Residence", ylab="cancelation %")
+grid()
+lines(rate~x, lwd=3, col='red')
+# we see a drop at len10
+# we see a drop at len19
+# goes up at 22
+# sample size is too low in these bins to see whats going on
+
+# lets group the tail ends to get a different look
+trav_complete <- trav_complete %>% mutate(length=cut(len.at.res, breaks=c(-Inf, seq(7,21,1), Inf), labels=c(seq(1,16,1))))
+table(trav_complete$cancel,trav_complete$length)
+tab<-table(trav_complete$cancel,trav_complete$length)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+x<-seq(1,16,1)
+plot(x,rate, pch=16, xlab="Length of Residence", ylab="cancelation %")
+grid()
+lines(rate~x, lwd=3, col='red')
+
+# lets make the strong groups, we dont have enough evidence about this upper tail
+# first break is more important
+# trav_complete <- trav_complete %>% mutate(length=cut(len.at.res, breaks=c(-Inf,10,15,20,Inf), labels=c(seq(1,4,1))))
+trav_complete <- trav_complete %>% mutate(length=cut(len.at.res, breaks=c(-Inf,10,18,Inf), labels=c(seq(1,3,1))))
+table(trav_complete$cancel,trav_complete$length)
+tab<-table(trav_complete$cancel,trav_complete$length)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+x<-seq(1,3,1)
+plot(x,rate, pch=16, xlab="Length of Residence", ylab="cancelation %")
+grid()
+lines(rate~x, lwd=3, col='red')
+
+
+plot(density(trav_complete$len.at.res), main="Length at Residence, pdf")
+abline(v=10, lty=2)
+abline(v=18, lty=2)
+
+```
+### Dwelling Type
+```{r}
+
+
+table(Validation$credit, Validation$dwelling.type)
+
+# We see that these landlords are not new customers it is just a new product for homeowners
+# Most of them have high credit so they probably behave similar to homeowners
+# this variable probably wont be very helpful
+
+# Dwelling type ~ tenant
+tenant<-ifelse(trav_complete$dwelling.type=="Tenant", 1, 0)
+trav_complete$tenant<-tenant
+
+# Our intuition took us here to look for a relationship between dwelling and length at residence
+# our intuition says length at residence wont matter if they are a renter
+trav_complete <- trav_complete %>% mutate(length2=cut(len.at.res, breaks=c(-Inf, seq(7,21,1), Inf), labels=c(seq(1,16,1))))
+
+response.i <- as.numeric(as.character((trav_complete$cancel)))
+mar.i <- as.numeric(trav_complete$tenant)
+kids.i <- as.numeric(trav_complete$length2)
+summary(kids.i)
+# exploratory plot
+res0.t <- tapply(response.i[mar.i==0], kids.i[mar.i==0], mean)
+res1.t <- tapply(response.i[mar.i==1], kids.i[mar.i==1], mean)
+par(lwd = 3, cex.axis = 1.5, cex.lab = 1.5, cex.main = 1.5,mar = c(5,5,1,1), mfrow = c(1,1))
+plot(res0.t ~ c(seq(1,16,1)), type = "l", ylim = c(0, max(res0.t, res1.t)), ylab = "% cancel", xlab = "# length at res", xlim=c(0,20))
+lines(res1.t ~ c(seq(1,16,1)), col = 2, lty = 2)
+legend("topright", legend = c("tenant==0", "tenant==1"), col = c(1,2), lty = c(1,2), cex = 1.5)
+```
+
+### Children
+```{r}
+# Our intuition took us here to look for a relationship
+
+# We are also suspicious about the 0 correlation between kids and marriage when we expected high corr
+
+response.i <- as.numeric(trav_complete$cancel)
+mar.i <- as.numeric(trav_complete$ni.marital.status)
+kids.i <- as.numeric(trav_complete$n.children)
+summary(kids.i)
+# exploratory plot
+res0.t <- tapply(response.i[mar.i==0], kids.i[mar.i==0], mean)
+res1.t <- tapply(response.i[mar.i==1], kids.i[mar.i==1], mean)
+par(lwd = 3, cex.axis = 1.5, cex.lab = 1.5, cex.main = 1.5,mar = c(5,5,1,1), mfrow = c(1,1))
+plot(res0.t ~ c(0,1,2), type = "l", ylim = c(0, max(res0.t, res1.t)), ylab = "% cancel", xlab = "# kids", xlim=c(0,12))
+lines(res1.t ~ c(0,1,2,3,4,5,6,7,8,9,10,11,12), col = 2, lty = 2)
+legend("topright", legend = c("marriage==0", "marriage==1"), col = c(1,2), lty = c(1,2), cex = 1.5)
+
+
+### Children
+trav_complete <- trav_complete %>% mutate(children=cut(n.children, breaks=c(-Inf,2,5,9,Inf), labels=c(1,2,3,4)))
+
+```
+### Age
+
+```{r}
+
+# Lets make some typical groups to look at 
+
+trav_complete <- trav_complete %>% mutate(age_g=cut(ni.age, breaks=c(-Inf, 25, 35, 45, 55, 65, 75, Inf), labels=c(1,2,3,4,5,6,7)))
+table(trav_complete$cancel,trav_complete$age_g)
+tab<-table(trav_complete$cancel,trav_complete$age_g)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+
+x<-seq(1,7,1)
+plot(x,rate, pch=16, xlab="Age", ylab="cancelation %")
+grid()
+lines(rate~x, lwd=3, col='red')
+
+# lets look at the interaction between the broker and age
+one=trav_complete$channel==1
+tab<-table(trav_complete$cancel[one],trav_complete$age_g[one])
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+tab<-table(trav_complete$cancel[!one],trav_complete$age_g[!one])
+rate2<-(tab[2,]/(tab[1,]+tab[2,]))
+
+plot(x, ylim=c(.1,.4), pch=16, xlab="Age", ylab="cancelation %", type="n")
+grid()
+lines(rate~x, lwd=3, col='red')
+lines(rate2~x, lwd=3, col="blue")
+# there appears to be a strong interaction here
+```
+
+
+
+
+
+```{r}
+trav_complete <- trav_complete %>% mutate(age_g=cut(ni.age, breaks=c(-Inf, 35, 55, Inf), labels=c(1,2,3)))
+table(trav_complete$cancel,trav_complete$age_g)
+tab<-table(trav_complete$cancel,trav_complete$age_g)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+rate
+# Lets adjust these groups a bit so that the jump in cancelation rate is even between breaks
+# These steps make the new variable ordinal which is better for correlation detection and model fitting
+
+trav_complete <- trav_complete %>% mutate(age_g=cut(ni.age, breaks=c(-Inf, 30, 55, Inf), labels=c(1,2,3)))
+table(trav_complete$cancel,trav_complete$age_g)
+tab<-table(trav_complete$cancel,trav_complete$age_g)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+rate
+```
+### Tenure
+```{r}
+plot(density(na.omit(trav_orig$tenure)), main="Tenure Bimode")
+# This is bi modal so we can make a dichotomous variable
+trav_complete <- trav_complete %>% mutate(tenure_g=cut(tenure, breaks=c(-Inf, 9, Inf), labels=c(0,1)))
+table(trav_complete$cancel,trav_complete$tenure_g)
+tab<-table(trav_complete$cancel,trav_complete$tenure_g)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+rate
+# I hope this works this makes a nice even break ...
+
+# Lets still look at some tables
+table(trav_complete$cancel,trav_complete$tenure)
+tab<-table(trav_complete$cancel,trav_complete$tenure)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+rate
+# I see a sweet spot for tenure 9, 10, 11 ... not intuitive
+trav_complete <- trav_complete %>% mutate(tenure_g=cut(tenure, breaks=c(-Inf,8, 11, Inf), labels=c(1,2,3)))
+table(trav_complete$cancel,trav_complete$tenure_g)
+tab<-table(trav_complete$cancel,trav_complete$tenure_g)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+rate
+# Very nice breaks! but the order is off
+# Can we just change the order... will that work as ordinal?
+trav_complete <- trav_complete %>% mutate(tenure_g=cut(tenure, breaks=c(-Inf,8, 11, Inf), labels=c(1,3,2)))
+plot(density(na.omit(trav_orig$tenure)), main="Tenure Phenom")
+abline(v=8, lty=2)
+abline(v=11, lty=2)
+
+
+# Here is a very complicated version with the danger zone
+trav_complete <- trav_complete %>% mutate(tenure_g=cut(tenure, breaks=c(-Inf,1,3,8, 11, Inf), labels=c(1,2,3,4,5)))
+table(trav_complete$cancel,trav_complete$tenure_g)
+tab<-table(trav_complete$cancel,trav_complete$tenure_g)
+rate<-(tab[2,]/(tab[1,]+tab[2,]))
+rate
+plot(density(na.omit(trav_orig$tenure)), main="Tenure Phenom")
+abline(v=1, lty=2, col=2)
+abline(v=3, lty=2, col=2)
+abline(v=8, lty=2, col=3)
+abline(v=11, lty=2, col=3)
+
+tenure_ord<-ifelse(trav_complete$tenure_g==1|trav_complete$tenure_g==3|trav_complete$tenure_g==5, 2 ,0)
+safe<-trav_complete$tenure_g==4
+unsafe<-trav_complete$tenure_g==2
+tenure_ord[safe]<-1
+tenure_ord[unsafe]<-3
+trav_complete$tenure_ord<-tenure_ord
+```
+### state
+```{r}
+trav_complete$state<-as.character(trav_complete$state)
+table(trav_complete$state)
+premtab<-(table(trav_complete$cancel, trav_complete$state))
+rate<-(premtab[2,]/(premtab[1,]+premtab[2,]))
+rate
+
+
+trav_complete$state2 <- trav_complete$state
+#Lets combine states using out of fold likelihood
+#a<-trav_complete$state2=="VA"
+#b<-trav_complete$state2=="WA"
+#c<-trav_complete$state2=="AZ"
+#trav_complete$state2[a|b|c] <- "VA/WA/AZ"
+
+
+b<-trav_complete$state2=="WA"
+c<-trav_complete$state2=="AZ"
+trav_complete$state2[b|c] <- "WA/AZ"
+
+
+
+a<-trav_complete$state2=="IA"
+b<-trav_complete$state2=="CO"
+trav_complete$state2[a|b] <- "IA/CO"
+
+premtab<-(table(trav_complete$cancel, trav_complete$state2))
+rate<-(premtab[2,]/(premtab[1,]+premtab[2,]))
+rate
+
+trav_complete$state2 <- as.factor(trav_complete$state2)
+trav_complete$state <- as.factor(trav_complete$state)
+
+sum(is.na(trav_complete$state))
+```
+
+
+
+### Premium
+```{r}
+# Lets break premium into
+trav_complete <- trav_complete %>% mutate(premium_g=cut(premium, breaks=c(-Inf,826,852,875,896,920,966,995, Inf), labels=c(seq(1,8,1))))
+table(trav_complete$cancel, trav_complete$premium_g)
+premtab<-(table(trav_complete$cancel, trav_complete$premium_g))
+rate<-(premtab[2,]/premtab[1,])
+# cancellation rate for each category
+
+rate
+# 896,920 prem greatest jump in cancelation
+# It seems there is a range of premiums in which cancelation rates are low
+# Maybe these are customers being priced correctly?
+
+# lets create simplified levels
+trav_complete <- trav_complete %>% mutate(premium_g=cut(premium, breaks=c(-Inf,852,875,896,920,966,Inf), labels=c(seq(1,6,1))))
+table(trav_complete$cancel, trav_complete$premium_g)
+premtab<-(table(trav_complete$cancel, trav_complete$premium_g))
+rate<-(premtab[2,]/premtab[1,])
+# cancellation rate for each category
+rate
+
+
+
+trav_complete <- trav_complete %>% mutate(premium_g=cut(premium, breaks=c(-Inf,852,966,Inf), labels=c(seq(1,3,1))))
+premtab<-(table(trav_complete$cancel, trav_complete$premium_g))
+rate<-(premtab[2,]/premtab[1,])
+rate
+out<-ifelse(trav_complete$premium_g==2,1,0)
+trav_complete$premium_g<-out
+
+```
+
+
+## LASSO
+```{r}
+# Elastic Net
+## LASSO
+
+# We can only use categories here
+names(trav_complete)
+# removed house color, coverage.type
+
+cats<-(trav_complete[,c("credit","ni.marital.status","children","channel","age_g")])
+
+
+cats<-(trav_complete[,c("credit","ni.marital.status","children","channel","claim.ind","age_g","tenure_ord", "state2","year","adults","length","tenant","premium_g")])
+cats<-sapply(cats, factor)
+str(cats)
+
+cancel<-trav_complete$cancel
+# We need dummy variables for an elastic net
+dummy<-dummyVars(~.,data=cats, fullRank = TRUE)
+dummyset<-as.data.frame(predict(dummy, cats))
+#write.csv(trav2, "full_rank_dummy.csv")
+#dummyset$cancel<-cancel
+
+# Make your train and test vectors, data must be a matrix
+train.x<-data.matrix(dummyset)
+train.y<-trav_complete[,c("cancel")]
+
+# Lets set elastic net (alpha) to 1, this is LASSO regression
+CV=cv.glmnet(x=train.x ,y=train.y, family='binomial', type.measure = 'auc', alpha=1, nlambda=100)
+
+plot(CV)
+
+# lets take the minimum error, most regularlized 1se down from min error
+fit=glmnet(x=train.x,y=train.y, family='binomial', alpha=1, lambda=CV$lambda.1se)
+nonzero<-fit$beta[,1]>0.001
+beta<-fit$beta[,1]
+beta<-beta[nonzero]
+beta[order(beta)]
+fit
+
+library(gglasso)
+
+group=c(1,1,2,3,3,3,4,5,5)
+train.x<-as.matrix(dummyset)
+train.y2<-ifelse(train.y==0,-1,1)
+
+
+cv <- cv.gglasso(x=train.x, y=train.y2, group=group, loss="logit",
+pred.loss="L2", lambda.factor=0.05,nfolds=10)
+
+
+fit <- gglasso(x=train.x, y=train.y2, group=group, loss="logit")
+
+
+
+coef.mat=fit$beta
+
+#Group1 enters the equation
+g1=max(which(coef.mat[1,]==0))
+
+#Group2 enters the equation
+g2=max(which(coef.mat[3,]==0))
+
+#Group3 enters the equation
+g3=max(which(coef.mat[4,]==0))
+
+#Group4 enters the equation
+g4=max(which(coef.mat[7,]==0))
+
+g5=max(which(coef.mat[8,]==0))
+
+
+#Coefficient Plot. Let's also use some nice colors
+library(RColorBrewer)
+cols=brewer.pal(5,name="Set1")
+
+plot(fit$b0,main="Coefficient vs Step",
+     ylab="Intercept",xlab="Step (decreasing Lambda =>)",
+     col=cols[1],
+     xlim=c(-1,100),
+     ylim=c(.5,-1.5),
+     type="l",lwd=4)
+grid()
+par(new=T)
+
+x=c(g1,g2,g3,g4,g5)
+y=c(fit$b0[g1],fit$b0[g2],fit$b0[g3],fit$b0[g4],fit$b0[g5])
+
+plot(x=x,y=y,pch=13,lwd=2,cex=2,col=cols[-1],
+     xlim=c(-1,100),ylim=c(.5,-1.5),
+     xaxt='n',yaxt='n',xlab="",ylab="")
+
+lmda=round(fit$lambda[c(g1,g2,g3,g4,g5)],3)
+text(x=x-0.05,y=y+0.01,labels=c("Group1","Group2","Group3","Group4","Group5"),pos=3,cex=0.9)
+text(x=x-0.05,y=y-0.01,labels=paste("Lambda\n=",lmda),pos=1,cex=0.8)
+
+
+
+lmbda=cv$lambda.1se
+(coefs=coef.gglasso(object=fit,s=lmbda))
+plot(cv)
+
+
+predict.gglasso(object=fit,newx=X,s=lmbda)
+
+```
+
+
+```{r}
+
+library(glinternet)
+
+
+cats<-(trav_complete[,c("credit","ni.marital.status","children","channel","claim.ind","age_g","tenure_ord", "state2","year","adults","length","tenant","premium_g")])
+
+# hand pick columns to drop with the largest sample size
+table(cats$credit)#high
+table(cats$ni.marital.status)#1
+table(cats$children)#1
+table(cats$channel)#1
+table(cats$claim.ind)#0
+table(cats$age_g)#2
+table(cats$tenure_ord)#2
+table(cats$state2)#IA/CO
+table(cats$year)#2016
+table(cats$adults)#1
+table(cats$length)#2
+table(cats$tenant)#0
+table(cats$premium_g)#0
+
+
+
+
+cats<-sapply(cats, factor)
+
+dummy<-dummyVars(~.,data=cats, fullRank = FALSE)
+dummyset<-as.data.frame(predict(dummy, cats))
+
+
+
+# remove columns hand picked for reference categories
+dummyset <- dummyset[,-c(1,5,6,11,12,15,18,20,27,28,33,35,37)]
+
+#now 25 vars/ columns
+
+
+
+```
+
+
+
+```{r}
+cats$credit<-factor(as.numeric(cats$credit))
+levels(cats$credit)<-c(0,1,2)
+levels(cats$children)<-c(0,1,2,3)
+levels(cats$age_g)<-c(0,1,2)
+
+cats<-sapply(cats, factor)
+train.x<-data.matrix(cats)
+train.y<-trav_complete[,c("cancel")]
+
+
+group=c(3,2,4,2,3)
+
+fit <- glinternet(X=train.x, Y=train.y, numLevels=group, nFolds = 5, lambda=NULL, nLambda=50,
+lambdaMinRatio=0.01, interactionCandidates=NULL, family="binomial")
+
+cv <- glinternet.cv(X=train.x, Y=train.y, numLevels=group, nFolds = 5, lambda=NULL, nLambda=50,
+lambdaMinRatio=0.01, interactionCandidates=NULL, family="binomial")
+
+
+fit$betahat
+coef(object, lambdaIndex = NULL, ...)
+
+lambda <- cv$lambda
+which(cv$lambda %in% cv$lambdaHat1Std)
+lambda.index <- which(cv$lambda %in% cv$lambdaHat1Std)
+
+
+plot(cv)
+
+coef(object=cv, lambdaIndex = lambda.index)
+
+14
+
+
+
+
+
+
+
+
+
+
+
+```
+```{r}
+# Coverage type isnt doing enough it could overfit the model
+# length makes sense and has a significant impact
+# adult group 4 has an impact, maybe we can make this dichotomous
+# see model below for p values
+modelset2 <- dummyset
+model <- glm(cancel.1~.,data=modelset2, family = "binomial"(link="logit"))
+summary(model)
+```
+#### In conclusion age can be dichotomous. It only seems to matter if they are older than 55. My intuition is that the younger age is already captured by lower credit. Adults can be lowered to 3 categories. Lasso tells us we will not recieve lift between the first two categories. Lets consider using the tails as danger zones. Coverage and house color will not provide lift. Lets focus on lift for this part of the competition but we may regress to a lower performance model in order to have an explanatory model.
+#### reduction; age, adults, tenure, state IA
+
+## ANOVA
+```{r}
+# For this stage we need to use our intuition to order variables in the model
+# The order should be nested or structurally dependent
+# With the first variable being the top of the hierachy
+
+model <- glm(cancel~credit+channel+family_level+adults+age_g+tenure_ord+length+state+claim.ind+year+premium_g ,data=cats, family = "binomial"(link="logit"))
+summary(model)
+anova(model, test="Chisq")
+```
+
+## Validation
+### Before Tweeks
+```{r}
+cats <- as.data.frame(cats)
+cats2<-(cats[,c('cancel','credit','channel','family_level','adults','age_g','tenure_ord','state','claim.ind','year','premium_g','length')])
+
+dummy<-dummyVars(~.,data=cats2, fullRank = TRUE)
+dummyset<-as.data.frame(predict(dummy, cats2))
+
+df<-dummyset
+data.size<-nrow(df)
+train.size<-0.8
+train.row.nums<-sample(1:data.size, data.size*train.size, replace=FALSE)
+test.row.nums<-setdiff(1:data.size,train.row.nums)
+
+train.data<-subset(df[train.row.nums,])
+test.data<-subset(df[test.row.nums,])
+
+model <- glm(cancel.1~., data=train.data, family = "binomial"(link="logit"))
+#model_save <- glm(cancel.1~.,data=modelset2, family = "binomial"(link="logit"))
+
+test<-test.data[,c(1)]
+
+predictions<-predict(objec = model, newdata = test.data[,-c(1)], type='response')
+
+auc <- roc(test, predictions)
+auc
+
+pred<-prediction(predictions, test.data[,c(1)])
+perf<-performance(pred,'tpr','fpr')
+plot(perf,main="ROC")
+abline(0,1,lty=3)
+```
+
+
+```{r, include=FALSE}
+# Import Data, Merge Data
+Validation <- read.csv("test.csv")
+states <- read.csv("free-zipcode-database-Primary.csv")
+MergedTestData <- merge(Validation,states, by.x = "zip.code", by.y = "Zipcode", all.x = TRUE)
+trav_test <- MergedTestData
+
+# To train model
+trav_orig <- read.csv('train.csv') # keep original set for NA analysis
+MergedTestData <- merge(trav_orig,states, by.x = "zip.code", by.y = "Zipcode", all.x = TRUE)
+#MergedTestData2 <- merge(MergedTestData, Pop, by.x = "zip.code", by.y = "zip.code", all.x = TRUE)
+
+
+trav_complete <- MergedTestData
+
+
+sum(is.na(trav_complete$sales.channel))
+
+channel<-ifelse(trav_complete$sales.channel=="Broker", 1, 0)
+channel[(is.na(channel))]<-0
+#sum(is.na(channel)) #just to check
+trav_complete$channel<-channel
+
+## Erroneous and NA
+# fixing erroneous cancel entry of -1
+summary(trav_complete$cancel)
+neg <- trav_complete$cancel==-1
+trav_complete$cancel[neg] <- NA
+# fixing erroneous age entry
+# Lets assume age was typed in wrong if over 117 for example 159 could be 59 or 225 could be 25
+# chose 117 because someone who is 18 might have retners insurance if 118=18 this is room for possible typo
+a<-trav_complete$ni.age>117
+trav_complete$ni.age[a]<-NA
+
+
+
+## Removal
+# We need to remove the merged data first because variables such as City had 1000s of NAs
+names(trav_complete)
+#a<-is.na(trav_complete$pop)
+#trav_complete$pop[a]<-0
+# OK now we can finally omit the remaining NAs, amros merged set has a bunch of nas so we need to remove all those columns first
+trav_complete<-trav_complete[,c("cancel","credit","channel","claim.ind","ni.age","tenure","state","year","ni.marital.status",
+                                "n.children","len.at.res","n.adults",'premium')]
+#"premium","City","len.at.res","dwelling.type","n.adults","EstimatedPopulation" for use later
+sum(is.na(trav_complete))
+trav_complete<-na.omit(trav_complete)
+
+## Variable Selection
+
+
+### Premium
+trav_complete <- trav_complete %>% mutate(premium_g=cut(premium, breaks=c(-Inf,852,966,Inf), labels=c(seq(1,3,1))))
+premtab<-(table(trav_complete$cancel, trav_complete$premium_g))
+rate<-(premtab[2,]/premtab[1,])
+rate
+out<-ifelse(trav_complete$premium_g==2,1,0)
+trav_complete$premium_g<-out
+
+
+### Adults
+trav_complete <- trav_complete %>% mutate(adults=cut(n.adults, breaks=c(-Inf, 5, Inf), labels=c(0,1)))
+premtab<-(table(trav_complete$cancel, trav_complete$adults))
+rate<-(premtab[2,]/premtab[1,])
+rate
+
+
+### Length of Residence
+trav_complete <- trav_complete %>% mutate(length=cut(len.at.res, breaks=c(-Inf,10,18,Inf), labels=c(seq(1,3,1))))
+
+### Children
+trav_complete <- trav_complete %>% mutate(children=cut(n.children, breaks=c(-Inf,2,5,9,Inf), labels=c(1,2,3,4)))
+
+### Age
+trav_complete <- trav_complete %>% mutate(age_g=cut(ni.age, breaks=c(-Inf, 55, Inf), labels=c(0,1)))
+#trav_complete <- trav_complete %>% mutate(age_g=cut(ni.age, breaks=c(-Inf, 30, 55, Inf), labels=c(1,2,3)))
+
+
+### Tenure
+a<-trav_complete$year=="2013"
+b<-trav_complete$year=="2014"
+c<-trav_complete$year=="2015"
+d<-trav_complete$year=="2016"
+
+plot(density(trav_complete$tenure[a]))
+plot(density(trav_complete$tenure[b]))
+plot(density(trav_complete$tenure[c]))
+plot(density(trav_complete$tenure[d]))
+
+hist(trav_complete$tenure[a])
+hist(trav_complete$tenure[b])
+hist(trav_complete$tenure[c])
+hist(trav_complete$tenure[d])
+
+#can we put a tracker on these people through a new variables
+#track<-trav_complete$year=="2013"&trav_complete$tenure==c(8,9,10)
+```
+
+
+```{r}
+trav_complete <- trav_complete %>% mutate(tenure_g=cut(tenure, breaks=c(-Inf,1,3,8, 11, Inf), labels=c(1,2,3,4,5)))
+table(trav_complete$cancel,trav_complete$tenure_g)
+
+tenure_ord<-ifelse(trav_complete$tenure_g==1|trav_complete$tenure_g==3|trav_complete$tenure_g==5, 2 ,0)
+safe<-trav_complete$tenure_g==4
+unsafe<-trav_complete$tenure_g==2
+tenure_ord[safe]<-1
+tenure_ord[unsafe]<-3
+trav_complete$tenure_ord<-tenure_ord
+
+
+
+### state
+table(trav_complete$state)
+trav_complete$state<-as.character(trav_complete$state)
+table(trav_complete$state, trav_complete$cancel)
+
+tab<-table(trav_complete$cancel, trav_complete$state)
+rate<-(tab[2,]/tab[1,])
+rate
+#VA and WA are similar in location, lets make a larger bin with them
+a<-trav_complete$state=="VA"
+b<-trav_complete$state=="WA"
+trav_complete$state[a|b] <- "VA/WA"
+#a<-trav_complete$state=="IA"
+#trav_complete$state[a] <- "AZ"
+
+trav_complete$state <- as.factor(trav_complete$state)
+#write.csv(trav_complete, "explore.csv")
+# use channel and premium and familylevel
+sum(is.na(trav_complete$state))
+
+### YEAR
+x<-as.factor(trav_complete$year)
+x<-revalue(x, c("2013"="1", "2016"="1"))
+x<-revalue(x, c("2014"="3", "2015"="2"))
+trav_complete$year<-x
+
+# We can only use categories here
+names(trav_complete)
+
+### POpulation type
+
+#trav_complete <- trav_complete %>% mutate(pop_type=cut(pop, breaks=c(-Inf,50000,Inf), labels=c(1,2)))
+#tab<-table(trav_complete$cancel, trav_complete$pop_type)
+#rate<-(tab[2,]/tab[1,])
+#rate
+
+cats<-(trav_complete[,c("cancel","credit","family_level","channel","claim.ind","age_g","tenure_ord","state","year",
+                        "length","premium_g","adults")])
+cats<-lapply(cats, factor)
+str(cats)
+# We need dummy variables for an elastic net
+dummy<-dummyVars(~.,data=cats, fullRank = TRUE)
+dummyset<-as.data.frame(predict(dummy, cats))
+#write.csv(trav2, "full_rank_dummy.csv")
+
+
+
+
+
+# Make your train and test vectors, data must be a matrix
+train.x<-data.matrix(dummyset[,-c(1)])
+train.y<-trav_complete[,c("cancel")] 
+
+# Lets set elastic net (alpha) to 1, this is LASSO regression
+CV=cv.glmnet(x=train.x ,y=train.y, family='binomial', type.measure = 'class', alpha=1, nlambda=100)
+
+plot(CV)
+
+# lets take the minimum error, most regularlized 1se down from min error
+fit=glmnet(x=train.x,y=train.y, family='binomial', alpha=1, lambda=CV$lambda.1se)
+fit$beta[,1]
+fit
+
+```
+
+### Validation Revised GLM
+```{r}
+model <- glm(cancel~credit+channel+family_level+adults+age_g+tenure_ord+length+state+claim.ind+year+premium_g+channel*age_g ,data=cats, family = "binomial"(link="logit"))
+summary(model)
+anova(model, test="Chisq")
+
+cats<-as.data.frame(cats)
+
+df<-cats
+data.size<-nrow(df)
+train.size<-0.8
+train.row.nums<-sample(1:data.size, data.size*train.size, replace=FALSE)
+test.row.nums<-setdiff(1:data.size,train.row.nums)
+
+train.data<-subset(df[train.row.nums,])
+test.data<-subset(df[test.row.nums,])
+test<-test.data[,c(1)]
+
+
+model <- glm(cancel~credit+channel+family_level+adults+age_g+tenure_ord+length+state+claim.ind+year+premium_g+channel*age_g, data=train.data, family = "binomial"(link="logit"))
+
+
+
+
+
+predictions<-predict(object = model, newdata = test.data[,-c(1)], type='response')
+# Plot model
+#library('pROC')
+
+auc <- roc(test, predictions)
+auc
+```
+### Bagged GLM
+```{r}
+
+train<-train.data
+test<-test.data
+f<-cancel~credit+channel+family_level+adults+age_g+tenure_ord+length+state+claim.ind+year+premium_g+channel*age_g
+length_divisor<-7  
+iterations<-15 
+
+predictions<-foreach(m=1:iterations,.combine=cbind) %do% {  
+  training_positions <- sample(nrow(train), size=floor((nrow(train)/length_divisor)))  
+  train_pos<-1:nrow(train) %in% training_positions
+  fit_bag<-glm(f, data=train, family=binomial(logit))
+  predict(fit_bag, newdata=test[,-c(1)], type="response")  
+}  
+
+p <- rowMeans(predictions)
+auc <- roc(test[,c(1)], p)
+auc
+
+
+pred<-prediction(p,test[,c(1)])
+perf<-performance(pred,'tpr','fpr')
+
+plot(perf,main="ROC")
+abline(0,1,lty=3)
+```
+
+### GBM
+```{r, include=FALSE, echo=TRUE}
+# Uses same train/test as above
+train.data<-subset(df[train.row.nums,])
+test.data<-subset(df[test.row.nums,])
+
+x<-train.data[,-c(1)]
+y<-as.factor(train.data[,c(1)])
+
+cancel2<- as.factor(ifelse(y==0,'no','yes'))
+y<-cancel2
+
+levels(y)
+
+
+
+model_test <- train(x,
+  y,
+  method = "gbm",
+  metric = "ROC",
+  trControl = trainControl(method = "cv", number = 4, summaryFunction =  twoClassSummary, classProbs = TRUE),
+  preProcess = c("center", "scale")
+)
+```
+```{r}
+summary(model_test)
+
+predictions<-predict(object = model_test, test.data[,-c(1)], type='prob')
+# Plot model
+plot(model_test)
+
+auc <- roc(test.data[,c(1)], predictions[[2]])
+
+print(auc$auc)
+```
+
+```{r, eval=FALSE, include=FALSE}
+
+# For final predictions
+tune_out<-tune(svm, cancel~credit+channel+family_level+adults+age_g+tenure_ord+length+state+claim.ind+year+premium_g+channel*age_g,
+  data=train.data,
+  kernel="radial",
+   ranges = list(epsilon = seq(0,1,0.1), cost = 2^(2:9)),
+  probability=T
+  )
+print(tune_out)
+
+tune_out<-tune(svm, cancel~credit+channel+family_level+adults+age_g+tenure_ord+length+state+claim.ind+year+premium_g+channel*age_g,
+  data=train.data,
+  kernel="radial",
+   ranges = list(epsilon = seq(0,.1,.01) cost = 2^(2:9)),
+  probability=T
+  )
+print(tune_out)
+
+bestmodel=tune_out$best.model
+summary(bestmodel)
+
+
+p<-predict(bestmodel, test.data[,-c(1)], type="class", probability=T)
+probs_valid<-attr(p, 'probabilities')
+probs_valid
+predictions_test <- probs_valid[,1]
+auc <- roc(test, predictions_test)
+auc
+plot(tune_out)
+# .671! thats terrible
+# do I have the kernal wrong? should it be SVR?
+```
