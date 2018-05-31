@@ -82,7 +82,7 @@ names(trav_complete)
 
 
 trav_complete<-trav_complete[,c("cancel","credit","channel","claim.ind","ni.age","tenure","State","year","ni.marital.status",
-                                "n.children","len.at.res","n.adults","dwelling.type","house.color","coverage.type",'premium')]
+                                "n.children","len.at.res","n.adults","dwelling.type","house.color","coverage.type",'premium','zip.code')]
 #"premium","City","len.at.res","dwelling.type","n.adults","EstimatedPopulation" for use later
 sum(is.na(trav_complete))
 colnames(trav_complete)[7]<-"state"
@@ -92,7 +92,7 @@ trav_complete<-na.omit(trav_complete)
 #We must start by making data categorical
 #We will use out-of-fold likelihood method
 #Making continuous variables discrete in order to reveal trends
-```
+
 
 ### Adults
 
@@ -130,7 +130,10 @@ trav_complete <- trav_complete %>% mutate(ni.age=cut(ni.age, breaks=c(-Inf, 35, 
 trav_complete <- trav_complete %>% mutate(tenure=cut(tenure, breaks=c(-Inf,8, 11, Inf), labels=c(1,3,2)))
 
 ### state
+state<-trav_complete$state
+zip.code <- trav_complete$zip.code
 trav_complete$state<-as.character(trav_complete$state)
+
 
 
 b<-trav_complete$state=="WA"
@@ -154,3 +157,40 @@ trav_complete$state <- as.factor(trav_complete$state)
 trav_complete <- trav_complete %>% mutate(premium=cut(premium, breaks=c(-Inf,852,966,Inf), labels=c(seq(1,3,1))))
 out<-ifelse(trav_complete$premium==2,1,0)
 trav_complete$premium<-out
+
+
+
+
+
+trav_complete$zip.code <- NULL
+# Dummy set for frequentist methods
+cats<-sapply(trav_complete, factor)
+dummy<-dummyVars(~.,data=cats, fullRank = TRUE)
+dummyset<-as.data.frame(predict(dummy, cats))
+
+
+# Dummy set for baysian methods
+bay <- trav_complete
+bay$state <- NULL
+bay$year <- NULL
+cats<-sapply(bay, factor)
+dummy<-dummyVars(~.,data=bay, fullRank = TRUE)
+dummyset_bayes<-as.data.frame(predict(dummy, bay))
+dummyset_bayes$state <- state
+dummyset_bayes$zip_code <- zip.code
+
+
+
+
+
+
+cats <- trav_complete
+cats$credit<-factor(as.numeric(cats$credit))
+levels(cats$credit)<-c(0,1,2)
+levels(cats$n.children)<-c(0,1,2,3)
+levels(cats$ni.age)<-c(0,1,2)
+
+
+
+
+
