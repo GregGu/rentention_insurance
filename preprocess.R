@@ -161,13 +161,12 @@ trav_complete$premium<-out
 
 
 
-
-trav_complete$zip.code <- NULL
 # Dummy set for frequentist methods
+trav_complete$zip.code <- NULL
 cats<-sapply(trav_complete, factor)
 dummy<-dummyVars(~.,data=cats, fullRank = TRUE)
 dummyset<-as.data.frame(predict(dummy, cats))
-
+write.csv(dummyset, "dummyset.csv")
 
 # Dummy set for baysian methods
 bay <- trav_complete
@@ -178,19 +177,15 @@ dummy<-dummyVars(~.,data=bay, fullRank = TRUE)
 dummyset_bayes<-as.data.frame(predict(dummy, bay))
 dummyset_bayes$state <- state
 dummyset_bayes$zip_code <- zip.code
+write.csv(dummyset_bayes, "dummyset_bayes.csv")
 
-
-
-
-
-
+# use this to make a partiall continuous set later
 cats <- trav_complete
 cats$credit<-factor(as.numeric(cats$credit))
 levels(cats$credit)<-c(0,1,2)
 levels(cats$n.children)<-c(0,1,2,3)
 levels(cats$ni.age)<-c(0,1,2)
-
-
+rm(list=ls())
 
 
 
