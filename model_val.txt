@@ -1,0 +1,31 @@
+model{
+for (j in 1:ntrain){
+    y.i[getitrain.j[j]] ~ dbern(pi.i[getitrain.j[j]])
+   }
+for (i in 1:N) {
+    yrep.i[i] ~ dbern(pi.i[i])
+    logit(pi.i[i]) = alpha.z[getz.i[i]] + B1*x[i,1] + B2*x[i,2] + B3*x[i,3] + B4*x[i,4] + B5*x[i,5] + B6*x[i,6] + B7*x[i,7] + B8*x[i,8]
+   }
+
+for (z in 1:Z) {
+  alpha.z[z] ~ dnorm(alpha.s[gets.z[z]], tau.z)
+}
+
+for (s in 1:S) {
+  alpha.s[s] ~ dnorm(alpha.c, tau.s)
+}
+
+alpha.c ~ dnorm(0, 0.01)
+B1 ~ dnorm(0, 0.01)
+B2 ~ dnorm(0, 0.01)
+B3 ~ dnorm(0, 0.01)
+B4 ~ dnorm(0, 0.01)
+B5 ~ dnorm(0, 0.01)
+B6 ~ dnorm(0, 0.01)
+B7 ~ dnorm(0, 0.01)
+B8 ~ dnorm(0, 0.01)
+tau.s = pow(sigma.s, -2)
+tau.z = pow(sigma.z, -2)
+sigma.s ~ dunif(0,5)
+sigma.z ~ dunif(0,5)
+}

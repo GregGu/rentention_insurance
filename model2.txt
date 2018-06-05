@@ -1,0 +1,22 @@
+model{
+for (i in 1:N) {
+  y.i[i] ~ dbern(pi.i[i])
+  logit(pi.i[i]) = alpha.z[getz.i[i]] + B1*x1[i] + B2*x2[i]
+}
+
+alpha.c ~ dnorm(0, 0.01)
+B1 ~ dnorm(0, 0.01)
+B2 ~ dnorm(0, 0.01)
+tau.s = pow(sigma.s, -2)
+tau.z = pow(sigma.z, -2)
+sigma.s ~ dunif(0,5)
+sigma.z ~ dunif(0,5)
+
+for (z in 1:Z) {
+  alpha.z[z] ~ dnorm(alpha.s[gets.z[z]], tau.z)
+}
+
+for (s in 1:S) {
+  alpha.s[s] ~ dnorm(alpha.c, tau.s)
+}
+}
